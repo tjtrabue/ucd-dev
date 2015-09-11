@@ -95,6 +95,8 @@ echo "Using server at: $install_dir"
 
 # build first b/c if build fails and Java is being updated, don't want to kill any running server instance
 if [[ $do_build -eq 1 ]]; then
+	echo "Building new code"
+	echo "-----------------"
 	"$THIS_SCRIPT_DIR"/build -CrTt dist
 fi
 
