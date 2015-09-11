@@ -94,7 +94,7 @@ while getopts ":aIi:l:F:" opt; do
 			echo "See Keywords section of man page for 'ps' to get more information."
 			valid_keywords
 			exit 0 ;;
-		i) install_dir="`fullpath "$OPTARG"`/" ;;
+		i) install_dir="`fullpath "$OPTARG"`" ;;
 		l) limit="$OPTARG" ;;
 		F) delimiter="$OPTARG" ;;
 		\?)
