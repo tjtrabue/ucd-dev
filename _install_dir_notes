@@ -1,0 +1,20 @@
+#!/bin/bash
+set -e
+
+installation_type="$1"
+case $installation_type in
+	server) var="DS_SERVER_INSTALLATIONS_DIR" ;;
+	agent) var="DS_AGENT_INSTALLATIONS_DIR" ;;
+	*)
+		echo "Error: Invalid installation type: $installation_type" >&2
+		exit 1 ;;
+esac
+
+echo "  - <install_dir> can be shortened to the install name if it's"
+echo "    located in the installations directory."
+echo "  - If <install_dir> is omitted, will attempt to find the install"
+echo "    directory for the first running instance of the server. If a"
+echo "    running instance is not found, it will default to"
+echo "    \"\$${var}/<branch_name>\", where <branch_name> is the"
+echo "    name of the current branch. If that cannot be resolved, it"
+echo "    will look at the current directory."

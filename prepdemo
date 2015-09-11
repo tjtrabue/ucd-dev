@@ -1,0 +1,83 @@
+#!/bin/bash
+set -e
+
+br() { git branch --no-color | egrep '^\*' | sed 's/^..//'; }
+
+# fullpath: get the absolute path of something
+fullpath() {
+	if [[ "$OSTYPE" =~ ^[Dd]arwin ]]; then
+		realpath "$@"
+	elif [[ "$OSTYPE" =~ ^[Ll]inux ]]; then
+		readlink -f "$@"
+	fi
+}
+
+usage() {
+	echo "Install pre- and post- versions of the most recent change for a branch."
+	echo "Usage: prepdemo [options] [<branch_name>]"
+	echo "Options:"
+	echo "  -C : Don't clean before building the after change."
+	echo "  -R : Don't resolve before building the after change."
+	echo "  -P <prefs_file>"
+	echo "    Specify installer preferences file. Use empty quotes for none."
+	echo "    [Default: ~/.deploy_installer_prefs]"
+	echo "Arguments:"
+	echo "  <branch_name>"
+	echo "    If not provided, will default to the current branch."
+	echo "Notes:"
+	echo "  - The after change gets installed first, so if there's custom stuff to do"
+	echo "    for it, just take care of it and use the -C and/or -R options."
+}
+
+# constants
+THIS_SCRIPT_DIR="$(dirname "`fullpath "$0"`")"
+INSTALLATIONS_DIR="$DS_SERVER_INSTALLATIONS_DIR"
+
+if [[ $1 == "--help" ]]; then
+	usage
+	exit 0
+fi
+
+OPTIND=0 # ommitting this can cause a bug
+
+# default options
+prefs_file=""
+after_clean="-c"
+after_resolve="-r"
+
+shopt -u nocasematch
+while getopts ":CRP:" opt; do
+	case $opt in
+		C) after_clean="" ;;
+		R) after_resolve="" ;;
+		P) prefs_file="-P '$OPTARG'" ;;
+		\?)
+			echo "Invalid Option: -$OPTARG" >&2
+			echo "Run `basename "$0"` --help for more information." >&2
+			exit 1 ;;
+		:)
+			echo "Option -$OPTARG requires an additional argument" >&2
+			echo "Run `basename "$0"` --help for more information." >&2
+			exit 1 ;;
+	esac
+done
+
+# get rid of options, leaving only positional arguments
+shift $(($OPTIND-1))
+
+# make sure the specified branch is active
+branch_name="${1:-`br`}"
+if [[ `br` != "$branch_name" ]]; then
+	if [[ ! `git checkout "$branch_name"` ]]; then
+		exit 1
+	fi
+fi
+
+# install after-change version of server
+echo "Installing after-change version"
+"$THIS_SCRIPT_DIR"/ucdinstall -k $after_clean $after_resolve $prefs_file "$INSTALLATIONS_DIR/after_$branch_name" > /dev/null
+
+# install before-change version of server
+git checkout `git log --no-color -n 2 --format=oneline | sed -n 2p | awk '{print $1}'` &> /dev/null
+echo "Installing before-change version"
+"$THIS_SCRIPT_DIR"/ucdinstall -crk $prefs_file "$INSTALLATIONS_DIR/before_$branch_name" > /dev/null

@@ -1,0 +1,345 @@
+#!/bin/bash
+set -e
+
+# fullpath: get the absolute path of something
+fullpath() {
+	if [[ "$OSTYPE" =~ ^[Dd]arwin ]]; then
+		realpath "$@"
+	elif [[ "$OSTYPE" =~ ^[Ll]inux ]]; then
+		readlink -f "$@"
+	fi
+}
+
+parse_file_changes() {
+	while read line; do
+		case ${line#.} in
+			java)
+				actionable=1
+				java_target="-t patches" ;;
+			js)
+				if [[ $no_js -eq 0 ]]; then
+					actionable=1
+					js_target="-${build_dojo}t war"
+				fi ;;
+			*)
+				prompt_user_to_continue "Unhandled type of file change detected in previous commit: .$line"
+				;;
+		esac
+	done
+
+	echo "actionable=$actionable"
+	echo "java_target='$java_target'"
+	echo "js_target='$js_target'"
+}
+
+prompt_user_to_continue() {
+	statement="$1"
+	question="${2:-Continue?}"
+	if [[ $no_prompt -eq 0 ]]; then
+		echo "$statement" >&2
+		answer=""
+		while [[ $answer != "y" && $answer != "n" ]]; do
+			echo "$question [y/n]" >&2
+			read -sn 1 answer
+		done
+		if [[ $answer == "n" ]]; then return 1; fi
+	fi
+}
+
+modify_change_bits() {
+	local target="$1"
+	if [[ -n $target ]]; then
+		change_bit_string="${change_bit_string}1"
+	else
+		change_bit_string="${change_bit_string}0"
+	fi
+}
+
+usage() {
+	echo "Create a patch based on the most recent commit"
+	echo "Usage: ucdpatch [options]"
+	echo "Options:"
+	echo "  -i : Also install the patch."
+	echo "  -r : Run server after installing the patch. Assumes -i option."
+	echo "  -R : Run server in debug mode after installing the patch. Assumes -i option."
+	echo "  -j : Ignore JavaScript changes."
+	echo "  -d : Install JavaScript changes for the patch using the packaged Dojo file."
+	echo "  -q : Do not prompt for permission to continue. WARNING: THIS OPTION CAN"
+	echo "       OVERWRITE FILES!"
+	echo "  -p <project_dir>"
+	echo "    Override the default project directory for which the patch is being created."
+	echo "    [Default: root of current repository (based on current directory)]"
+	echo "  -n <patch_name>"
+	echo "    Override the default patch name. Naming convention is:"
+	echo "         ucd-(ucd_version)-(APAR#)-(patch-summary)"
+	echo "    [Default: \`basename <branch_name>\`]"
+	echo "  -I <install_dir>"
+	echo "    Override the automatically resolved server installation directory."
+	echo "    If the server is located in \$DS_SERVER_INSTALLATIONS_DIR, it can be"
+	echo "    shortened to the directory name. This option is ignored if the -i option is"
+	echo "    not specified. [Default: \$DS_SERVER_INSTALLATIONS_DIR/<version>]"
+	echo "  -v <ui_version>"
+	echo "    Override the default ui version directory name (located at:"
+	echo "    <intall_dir>/opt/tomcat/webapps/ROOT/static/<ui_version>). [Default: dev]"
+	echo "  -z"
+	echo "    Zip all of the required patch files together with a README created from the"
+	echo "    default template. Zip archive will be located at: ./<patch_name>.zip"
+	echo "  -Z <read_me>"
+	echo "    Zip all of the required patch files together with the specified README file."
+	echo "    If the README file starts with % it will be treated as a template. Zip"
+	echo "    archive will be located at: ./<patch_name>.zip"
+	echo "Environment Variables:"
+	echo "  DS_SERVER_INSTALLATIONS_DIR"
+	echo "    Path to local server installations directory."
+	echo "  DS_PATCHER_DIR"
+	echo "    Path to local checkout of Patcher project."
+	echo "  DS_JAVA_PATCH_README_TEMPLATE"
+	echo "    Path to the default README template for patches containing only Java changes."
+	echo "  DS_JS_PATCH_README_TEMPLATE"
+	echo "    Path to the default README template for patches containing only JavaScript"
+	echo "    changes."
+	echo "  DS_JAVA_JS_PATCH_README_TEMPLATE"
+	echo "    Path to the default README template for patches containing only Java and"
+	echo "    JavaScript changes."
+	echo "Notes:"
+	echo "  - <branch_name> is determined with respect to the specified project directory."
+	echo "  - <version> is parsed from <patch_name> according to the naming convention."
+	echo "  - <apar_id> is parsed from <patch_name> according to the naming convention (PMR#)."
+	echo "  - Suported README template replacement tags (case-sensitive) are:"
+	echo "        [apar number]   : <apar_id>"
+	echo "        [apar abstract] : APAR abstract summary from CQPAR"
+	echo "        [ucd version]   : <ucd_version>"
+	echo "        [ui version]    : <ui_version>"
+	echo "        [jar name]      : <patch_name>"
+}
+
+if [[ $1 == "--help" ]]; then
+	usage
+	exit 0
+fi
+
+# constants
+THIS_SCRIPT_DIR="$(dirname "`fullpath "$0"`")"
+INSTALLATIONS_DIR="$DS_SERVER_INSTALLATIONS_DIR"
+
+# default options
+install_patch=0
+run_server=0
+debug=
+install_dir=
+project_dir="`git rev-parse --show-toplevel 2> /dev/null`"
+patch_name=
+zip=0
+no_js=0
+install_dojo=0
+no_prompt=0
+ui_version="dev"
+readme=
+readme_template=
+
+# parse options
+while getopts ":irRjdqp:n:I:v:zZ:" opt; do
+	case $opt in
+		i) install_patch=1 ;;
+		r)
+			install_patch=1
+			run_server=1 ;;
+		R)
+			install_patch=1
+			run_server=1
+			debug="-debug" ;;
+		j) no_js=1 ;;
+		d) install_dojo=1 ;;
+		q) no_prompt=1 ;;
+		p)
+			project_dir="$OPTARG"
+			if [[ ! -d "$project_dir" ]]; then
+				echo "Error: Specified project directory does not exist: $project_dir" >&2
+				exit 1
+			fi ;;
+		n) patch_name="$OPTARG" ;;
+		I)
+			install_dir="$OPTARG"
+			if [[ -d "$INSTALLATIONS_DIR/$install_dir" ]]; then
+				install_dir="$INSTALLATIONS_DIR/$install_dir"
+			elif [[ ! -d "$install_dir" ]]; then
+				echo "Error: Specified install directory does not exist: $install_dir" >&2
+				exit 1
+			fi ;;
+		v) ui_version="$OPTARG" ;;
+		z) zip=1 ;;
+		Z)
+			zip=1
+			if [[ $OPTARG =~ ^% ]]; then
+				readme_template="${OPTARG#%}"
+			else
+				readme="$OPTARG"
+			fi ;;
+		\?)
+			echo "Invalid Option: -$OPTARG" >&2
+			usage >&2; exit 1 ;;
+		:)
+			echo "Option -$OPTARG requires an additional argument" >&2
+			usage >&2; exit 1 ;;
+	esac
+done
+
+if [[ -z $project_dir ]]; then
+	echo "Error: Could not resolve project directory." >&2
+	exit 1
+fi
+
+pushd "$project_dir" > /dev/null
+
+# set a trap to clean up in case an error occurs
+trap 'trap - ERR SIGHUP SIGINT SIGTERM; popd > /dev/null; exit 1' ERR SIGHUP SIGINT SIGTERM
+
+branch_name="`git branch --no-color | egrep '^\*' | sed 's/^..//'`"
+
+# set default patch name if user did not override
+if [[ -z $patch_name ]]; then
+	patch_name="$(basename "$branch_name")"
+fi
+
+# resolve default install directory if user did not override
+ucd_version="`echo "$patch_name" | cut -d '-' -f 2`"
+if [[ $install_patch -eq 1 && -z $install_dir ]]; then
+	install_dir="$INSTALLATIONS_DIR/$ucd_version"
+	if [[ ! -d "$install_dir" ]]; then
+		echo "Error: could not resolve install directory" >&2
+		exit 1
+	fi
+fi
+
+# determine whether or not to build Dojo
+build_dojo=
+if [[ $install_dojo -eq 1 || -n $zip ]]; then
+	build_dojo="d"
+fi
+
+# determine what type of files have changed
+java_target=
+js_target=
+actionable=0
+cur_commit_id="`git log -n 1 --format=oneline --no-color | awk '{print $1}'`"
+eval "`git diff-tree --no-commit-id --name-only -r "$cur_commit_id" \
+	| egrep -o '\.[^.]*$' \
+	| sort \
+	| uniq \
+	| parse_file_changes`"
+
+change_bit_string=
+modify_change_bits $java_target
+modify_change_bits $js_target
+
+# make sure there's actionable changes in the most recent commit
+if [[ $actionable -eq 0 ]]; then
+	echo "Error: No actionable file changes detected in most recent commit." >&2
+	exit 1
+fi
+
+# prepare the patches target for ant to build the Java patch
+if [[ -n $java_target ]]; then
+	echo "Updating build.xml to create patch: $patch_name"
+	git checkout build.xml # clean build.xml
+	java -jar "$DS_PATCHER_DIR"/dist/patcher.jar "${patch_name}.jar" "$project_dir"
+	echo
+fi
+
+# figure out which JS files changed (but only if we need to)
+if [[ -n $js_target && -z $build_dojo ]]; then
+	js_files="`git diff-tree --no-commit-id --name-only -r "$cur_commit_id" | egrep '\.js$'`"
+fi
+
+echo "Building patch"
+"$THIS_SCRIPT_DIR"/build -Cr $java_target $js_target
+echo
+
+popd > /dev/null
+trap - ERR SIGHUP SIGINT SIGTERM
+
+# build a zip archive of the patch if requested
+if [[ $zip -eq 1 ]]; then
+	if [[ -e "$patch_name" ]]; then
+		echo "WARNING: '$patch_name' already exists." >&2
+		prompt_user_to_continue "Continuing will permanently delete it!"
+		echo "Deleting existing '$patch_name'" >&2
+		rm -rf "$patch_name"{,.zip}
+	fi
+	mkdir -p "$patch_name"
+
+	# create README from template if README not provided
+	if [[ -z $readme ]]; then
+		apar_id="`echo "$patch_name" | tr '-' '\n' | egrep '^PI[A-Z0-9]+$' | tail -1`"
+		if [[ -z $apar_summary ]]; then
+			echo "Abstract summary for APAR # $apar_id?"
+			read apar_summary
+		fi
+
+		if [[ -z $readme_template ]]; then
+			# determine which default readme template to based of changed file types from most recent commit
+			# change bits: JAVA, JS
+			case $change_bit_string in
+				10) readme_template="$DS_JAVA_PATCH_README_TEMPLATE" ;;
+				01) readme_template="$DS_JS_PATCH_README_TEMPLATE" ;;
+				11) readme_template="$DS_JAVA_JS_PATCH_README_TEMPLATE" ;;
+			esac
+		fi
+
+		readme="`mktemp /tmp/README_XXXXXX`"
+		sed -e "s:\[apar number\]:$apar_id:g" \
+			-e "s:\[apar abstract\]:$apar_summary:g" \
+			-e "s:\[ucd version\]:$ucd_version:g" \
+			-e "s:\[ui version\]:$ui_version:g" \
+			-e "s:\[jar name\]:$patch_name:g" \
+			"$readme_template" > "$readme"
+	fi
+
+	# copy files
+	cp "$readme" "$patch_name/README.txt"
+	cp "$project_dir/patches/${patch_name}.jar" "$patch_name"
+	if [[ $install_dojo -eq 1 ]]; then
+		cp "$project_dir/build/war/static/dev/ucdjs-pack.js" "$patch_name"
+	else
+		for file in "${js_files[@]}"; do
+			cp "$project_dir/$file" "$patch_name"
+		done
+	fi
+
+	# zip the archive
+	zip -r "$patch_name"{.zip,}
+fi
+
+if [[ $install_patch -eq 1 ]]; then
+	# make sure the specified server isn't currently running
+	server_pid=`"$THIS_SCRIPT_DIR"/curserv -l 1 -i "$install_dir" pid`
+	if [[ -n $server_pid ]]; then
+		echo "Waiting for specified server to stop"
+		"$install_dir"/bin/server stop -force
+		while kill -0 $server_pid &> /dev/null; do
+			sleep .5
+		done
+		echo
+	fi
+
+	echo "Installing patch to server"
+	if [[ -n $java_target ]]; then
+		cp "$project_dir/patches/${patch_name}.jar" "$install_dir/appData/patches/${patch_name}.jar"
+	fi
+	if [[ -n $js_target ]]; then
+		if [[ $install_dojo -eq 1 ]]; then
+			cp "$project_dir/build/war/static/dev/ucdjs-pack.js" "$install_dir/opt/tomcat/webapps/ROOT/static/$ui_version"
+		else
+			mkdir -p "$install_dir/opt/tomcat/webapps/ROOT/$ui_version"
+			for file in $js_files; do
+				cp "$project_dir/$file" "$install_dir/opt/tomcat/webapps/ROOT/static/$ui_version/${file#src/web/war}"
+			done
+		fi
+	fi
+	echo
+
+	if [[ $run_server -eq 1 ]]; then
+		echo "Running server"
+		"$install_dir"/bin/server run $debug &
+	fi
+fi

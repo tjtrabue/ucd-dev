@@ -1,0 +1,35 @@
+#!/bin/bash
+set -e
+
+installation_type="$1"
+shift
+case $installation_type in
+	server)
+		installations_dir="$DS_SERVER_INSTALLATIONS_DIR"
+		dash_a='' ;;
+	agent)
+		installations_dir="$DS_AGENT_INSTALLATIONS_DIR"
+		dash_a="a" ;;
+	*)
+		echo "Error: Invalid installation type: $installation_type" >&2
+		exit 1 ;;
+esac
+
+install_dir=''
+if [[ $# -eq 0 ]]; then
+	install_dir="`curserv -${dash_a}l 1 install_dir`"
+	if [[ -z $install_dir ]]; then
+		install_dir="`git branch --no-color 2> /dev/null | egrep '^\*' | sed 's/^..//'`"
+		if [[ -z $install_dir || ! -e "$installations_dir/$install_dir" ]]; then
+			install_dir="`pwd`"
+		else
+			install_dir="$installations_dir/$install_dir"
+		fi
+	fi
+elif [[ -e "$1" ]]; then
+	install_dir="$1"
+elif [[ -e "$installations_dir/$1" ]]; then
+	install_dir="$installations_dir/$1"
+fi
+
+echo "$install_dir"

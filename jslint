@@ -1,0 +1,37 @@
+#!/bin/bash
+set -e
+
+# fullpath: get the absolute path of something
+fullpath() {
+	if [[ "$OSTYPE" =~ ^[Dd]arwin ]]; then
+		realpath "$@"
+	elif [[ "$OSTYPE" =~ ^[Ll]inux ]]; then
+		readlink -f "$@"
+	fi
+}
+
+# constants
+JSLINT_JAR="$ANT_HOME/lib/jslint4java.jar"
+#JSLINT_CONFIG="--bitwise --browser --eqeqeq --immed --newcap --undef --indent 4"
+JSLINT_CONFIG="--browser --devel --indent 4 --fragment --maxerr 9999 --newcap --nomen --plusplus --vars --sloppy --todo --white"
+GLOBALS="--predef dojo,dojox,dijit,require,define,$,jQuery,mxClient,mxUtils,mxToolbar,mxPrintPreview,mxWindow,mxCellOverlay,mxImage,mxPoint,mxConstants,mxEvent,bootstrap,navBar,appState,js,util,config,i18n,uReleaseConfig,deploy,getBTD,applyBTD,formatters,security"
+
+if [[ $# -eq 0 ]]; then
+    echo "No files specified"
+    exit 0
+fi
+
+FILES="$( find "$@" -type f \( -iname '*.js' -or -iname '*.html' \) -print )"
+if [[ -z "$FILES" ]]; then
+    echo "No JS files to scan"
+    exit 0
+fi
+
+echo "$FILES" \
+	| {
+		while read -s file; do
+			fullpath "$file"
+		done
+	} \
+	| tr '\n' '\0' \
+	| xargs -0 java -jar "$JSLINT_JAR" $GLOBALS $JSLINT_CONFIG

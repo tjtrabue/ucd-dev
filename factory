@@ -1,0 +1,133 @@
+#!/bin/bash
+set -e
+
+# fullpath: get the absolute path of something
+fullpath() {
+	if [[ "$OSTYPE" =~ ^[Dd]arwin ]]; then
+		realpath "$@"
+	elif [[ "$OSTYPE" =~ ^[Ll]inux ]]; then
+		readlink -f "$@"
+	fi
+}
+
+if [[ $1 == '--help' ]]; then
+	echo "Register a factory class in UrbanCode Deploy."
+	echo "Usage: `basename "$0"` <class_name>"
+	echo "Arguments:"
+	echo "  <class_name>"
+	echo "    Can be a fully qualified class name, a path to a Java file, the name of a"
+	echo "    Java file, or the short name of the class. If not fully qualified, will"
+	echo "    recursively look for an existing class in the current directory. If not"
+	echo "    found and <class_name> looks like a path an error will be thrown. Otherwise,"
+	echo "    if not found, a final attempt will be made to resolve the fully qualified"
+	echo "    name by assuming the current directory represents the place the class should"
+	echo "    exist."
+	exit 0
+fi
+
+if [[ $# -lt 1 ]]; then
+	echo "Error: Must specify a class name for the new factory." >&2
+	exit 1
+fi
+
+# resolve fully qualified factory name
+arg="$1"
+if [[ ! $arg =~ ^(.*[/.])?com[/.].* ]]; then
+	file="`find . -iname "${arg%.java}.java"`"
+
+	if [[ -z $file ]]; then
+		arg="`pwd | tr '/' '.'`.$arg"
+	else
+		arg="`fullpath "$file"`"
+	fi
+fi
+if [[ $arg =~ .*/.*$ ]]; then
+	arg="${arg%.java}"
+	if [[ ! -f "$arg.java" ]]; then
+		echo "Error: `echo "$arg" | tr '.' '/'`.java does not exist" >&2
+		exit 1
+	fi
+fi
+arg="com/${arg#*/com/}"
+arg="com.${arg#*.com.}"
+if [[ ! $arg =~ ^com(\.[a-zA-Z]+)+$ ]]; then
+	echo "Error: Cannot resolve fully qualified class name: \"$arg\"" >&2
+	exit 1
+fi
+full_factory_name="`echo "$arg" | tr '/' '.'`"
+echo Registering $full_factory_name
+
+factory_name="${full_factory_name##*.}"
+var_name="`echo "${factory_name:0:1}" | tr 'A-Z' 'a-z'``echo "${factory_name:1}"`"
+
+# switch to the root directory of the project
+project_root="`git rev-parse --show-toplevel 2> /dev/null`"
+if [[ -z $project_root ]]; then
+	echo "Error: Cannot determine root directory for the repository checkout." >&2
+	exit 1
+fi
+pushd "$project_root" &> /dev/null
+
+FACTORY_LOOKUP="`find . -type f -name FactoryLookup.java`"
+FACTORY_PROVIDER="`find . -type f -name FactoryProvider.java`"
+FACTORY_PROVIDER_IMPL="`find . -type f -name FactoryProviderImpl.java`"
+TEST_FACTORY_PROVIDER_IMPL="`find . -type f -name TestFactoryProviderImpl.java`"
+
+add_import() {
+	local file="$1"
+	sed $SED_EXT_RE -i "" "/^import com.urbancode.*;$/,/^$/{ /^$/i\\
+import $full_factory_name;
+}" "$file"
+}
+
+add_method() {
+	local file="$1"
+	local method="$2"
+	sed $SED_EXT_RE -i "" "/^}$/d" "$file"
+	echo "$method" >> "$file"
+	echo -e '}\n' >> "$file"
+}
+
+add_var() {
+	local file="$1"
+	sed $SED_EXT_RE -i "" "/^    private.*;$/,/^$/{ /^$/i\\
+\    private $factory_name $var_name;
+}" "$file"
+}
+
+add_import "$FACTORY_LOOKUP"
+add_import "$FACTORY_PROVIDER"
+add_import "$FACTORY_PROVIDER_IMPL"
+add_import "$TEST_FACTORY_PROVIDER_IMPL"
+
+add_method "$FACTORY_LOOKUP" \
+"
+    synchronized static public $factory_name get$factory_name() {
+        return factoryProvider.get$factory_name();
+    }"
+add_method "$FACTORY_PROVIDER" \
+"    public $factory_name get$factory_name();"
+add_method "$FACTORY_PROVIDER_IMPL" \
+"
+    @Override
+    synchronized public $factory_name get$factory_name() {
+        if ($var_name == null) {
+            $var_name = new $factory_name();
+        }
+        return $var_name;
+    }"
+add_method "$TEST_FACTORY_PROVIDER_IMPL" \
+"
+    @Override
+    public $factory_name get$factory_name() {
+        if ($var_name == null) {
+            $var_name = mock($factory_name.class);
+        }
+        return $var_name;
+    }"
+
+add_var "$FACTORY_PROVIDER_IMPL"
+add_var "$TEST_FACTORY_PROVIDER_IMPL"
+
+# switch back to original working directory
+popd &> /dev/null

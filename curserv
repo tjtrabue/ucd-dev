@@ -1,0 +1,158 @@
+#!/bin/bash
+set -e
+
+usage() {
+	echo "Get information about a currently running server or agent."
+	echo "Usage: curserv [options] [<info_list>]"
+	echo "Options:"
+	echo "  -a : Search for running agents instead of servers."
+	echo "  -I : Display the available information fields and exit."
+	echo "  -i <install_dir>"
+	echo "    Only display information for the server at <install_dir>."
+	echo "  -l <limit>"
+	echo "    Specify the maximum number of rows to be returned, where each row"
+	echo "    corresponds to a running instance of the server."
+	echo "  -F <delimiter>"
+	echo "    Use <delimiter> to separate output fields. [Default: tab]"
+	echo "Arguments:"
+	echo "  [<info_list>]"
+	echo "    Coma-separated list of information fields to display. The fields will be"
+	echo "    displayed in the order they appear in the list. If not supplied, just say"
+	echo "    whether or not it is running."
+	echo "Notes:"
+	echo "  - If no server is currently running, nothing will be printed."
+}
+
+# col: get columns in specified order
+col() {
+	if [[ $1 == "-F" ]]; then
+		awk -F "$2" '{print $('$(echo "${@: +3}" | sed -e s/-/NF-/g -e 's/ /),$(/g')')}'
+	else
+		awk '{print $('$(echo "$@" | sed -e s/-/NF-/g -e 's/ /),$(/g')')}'
+	fi
+}
+
+# fullpath: get the absolute path of something
+fullpath() {
+	if [[ "$OSTYPE" =~ ^[Dd]arwin ]]; then
+		realpath "$@"
+	elif [[ "$OSTYPE" =~ ^[Ll]inux ]]; then
+		readlink -f "$@"
+	fi
+}
+
+valid_ps_keywords() {
+	ps L | tr ' ' '\n' | grep -Fxvf <(echo $INVALID_KEYWORDS | tr ' ' '\n')
+}
+valid_keywords() {
+	valid_ps_keywords
+	echo install_dir
+}
+
+parse_install_dir() {
+	local rel_path
+	if [[ $agent -eq 0 ]]; then
+		rel_path="`sed 's:.*dirs=\(.*\)endorsed.*:\1:'`"
+	else
+		rel_path="`sed 's:.*-jar \(.*\)monitor.*:\1:'`"
+	fi
+	fullpath "$rel_path"
+}
+
+filter_commands() {
+	if [[ $agent -eq 0 ]]; then
+		grep -i0 uDeploy | grep server
+	else
+		grep -0 agent | grep urbancode
+	fi
+}
+
+if [[ $1 == "--help" ]]; then
+	usage
+	exit 0
+fi
+
+# constants
+# ps L displays some invalid keywords
+INVALID_KEYWORDS="caught ignored"
+if [[ `uname` == *Darwin* ]]; then
+	SED_EXT_RE="-E"
+elif [[ `uname` == *Linux* ]]; then
+	SED_EXT_RE="-r"
+fi
+
+# default options
+limit=0
+delimiter='\t'
+agent=0
+
+# parse options
+while getopts ":aIi:l:F:" opt; do
+	case $opt in
+		a) agent=1 ;;
+		I)
+			echo "See Keywords section of man page for 'ps' to get more information."
+			valid_keywords
+			exit 0 ;;
+		i) install_dir="`fullpath "$OPTARG"`/" ;;
+		l) limit="$OPTARG" ;;
+		F) delimiter="$OPTARG" ;;
+		\?)
+			echo "Invalid Option: -$OPTARG" >&2
+			usage >&2; exit 1 ;;
+		:)
+			echo "Option -$OPTARG requires an additional argument" >&2
+			usage >&2; exit 1 ;;
+	esac
+done
+
+shift $(($OPTIND-1))
+
+if [[ $# -gt 0 ]]; then
+	fields="`echo $@ | tr ',' ' '`"
+fi
+
+pids="`ps ww -Ao pid,command | \
+	filter_commands | \
+	grep -v eclipse | \
+	grep -v grep | {
+		while read -s line; do
+			if [[ -n $install_dir && $install_dir != $(echo "$line" | parse_install_dir) ]]; then
+				continue
+			fi
+			echo "$line"
+		done
+	} | col 1 | tr '\n' ' ' | xargs -L 1 -J % echo %`"
+
+if [[ -z $fields ]]; then
+	if [[ -n $pids ]]; then
+		echo "Running"
+	else
+		# NOTE: for some reason this is never reached ... look into this
+		echo "Not running"
+	fi
+	exit 0
+fi
+
+{
+	for pid in $pids; do
+		for field in $fields; do
+			{
+				if [[ $field =~ ^install.*$ ]]; then
+					ps ww -o command -p $pid | tail -1 | parse_install_dir
+				else
+					ps ww -o $field -p $pid | tail -1
+				fi
+			} | xargs -L 1 echo -n
+			echo -ne "$delimiter"
+		done
+		echo
+	done
+} | {
+	if [[ $limit -gt 0 ]]; then
+		head -$limit
+	else
+		tr '\n' '\0' | xargs -0L 1 echo
+	fi
+} | sed $SED_EXT_RE "s/^( |`echo -e '\t'`)*//;s/( |`echo -e '\t'`)*$//"
+# this last line just strips leading and trailing whitespace from the output

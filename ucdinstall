@@ -1,0 +1,193 @@
+#!/bin/bash
+set -e
+
+print_main_options() {
+	echo "  -c : Clean the build directory to start from scratch."
+	echo "  -C : Clean build and lib directories first. Overrides -c option."
+	echo "  -r : Resolve all dependencies."
+	echo "  -d : Package Dojo (takes a while)."
+	echo "  -p : Resolve plugins."
+	echo "  -v : Use verbose progress output."
+	echo "  -f : Force halt on failure."
+	echo "  -k : Skip tests."
+	echo "  -P <file>"
+	echo "    Specify the installer preferences file to use. Use empty quotes for none."
+	echo "    [Default: ~/.deploy_installer_prefs]"
+}
+
+print_script_integration_options() {
+	echo "  -h 0 : Print getopts string (only meant for script integration)."
+	echo "  -h 1 : Print usage options (only meant for script integration)."
+}
+
+usage (){
+	echo "Usage: `basename "$0"` [options] [<install_dir>]"
+	echo "Options:"
+	print_main_options
+	print_script_integration_options
+	echo "Notes:"
+	echo "  - <install_dir> can be shortened to the install name if it already exists"
+	echo "    in the installations directory."
+	echo "  - If <install_dir> references an existing directory, it will be cleaned out"
+	echo "    before being used."
+	echo "  - If <install_dir> is not specified, it will default to"
+	echo "    \"\$DS_SERVER_INSTALLATIONS_DIR/<branch_name>\", where <branch_name> is"
+	echo "    the name of the current branch."
+}
+
+cleanup (){
+	if [[ -n "$prefs_file" ]]; then
+		mv src/install/overlay/install.properties{.tmp,}
+	fi
+
+	if [[ $halt_on_failure -eq 1 ]]; then
+		mv build.xml{.tmp,}
+	fi
+
+	if [[ $switch_cwd -eq 1 ]]; then
+		popd &> /dev/null
+	fi
+}
+
+# fullpath: get the absolute path of something
+fullpath() {
+	if [[ "$OSTYPE" =~ ^[Dd]arwin ]]; then
+		realpath "$@"
+	elif [[ "$OSTYPE" =~ ^[Ll]inux ]]; then
+		readlink -f "$@"
+	fi
+}
+
+# constants
+THIS_SCRIPT_DIR="$(dirname "`fullpath "$0"`")"
+INSTALLATIONS_DIR="$DS_SERVER_INSTALLATIONS_DIR"
+OPTS_STRING=":cCrdpvfkP:"
+
+if [[ $1 == "--help" ]]; then
+	usage
+	exit 0
+fi
+
+# default options
+clean=
+resolve="-Dresolve.no=y"
+dojo="-Ddojo.build.no=y"
+verbose="-Denun.no=y"
+prefs_file="$HOME/.deploy_installer_prefs"
+halt_on_failure=0
+skip_tests=""
+resolve_plugins=""
+
+OPTIND=0 # ommitting this causes a bug
+
+shopt -u nocasematch
+while getopts "${OPTS_STRING}h:" opt; do
+	case $opt in
+		h)
+			if [[ $OPTARG == "0" ]]; then
+				echo "$OPTS_STRING"
+			elif [[ $OPTARG == "1" ]]; then
+				print_main_options
+			else
+				echo "Error: Invalid argument for -h: $OPTARG" >&2
+				exit 1
+			fi
+			exit 0 ;;
+		c) [[ -z $clean ]] && clean="clean" ;;
+		C) clean="clean-all" ;;
+		r) resolve="" ;;
+		d) dojo="" ;;
+		p) resolve_plugins="resolve-plugins" ;;
+		v) verbose="" ;;
+		f) halt_on_failure=1 ;;
+		k) skip_tests="-Dtests.no=y" ;;
+		P)
+			prefs_file="$OPTARG"
+			if [[ -n "$prefs_file" && ! -f "$prefs_file" ]]; then
+				echo "\"$prefs_file\" is not an existing file." >&2
+				exit 1
+			fi ;;
+		\?)
+			echo "Invalid Option: -$OPTARG" >&2
+			usage >&2
+			exit 1 ;;
+		:)
+			echo "Option -$OPTARG requires an additional argument" >&2
+			usage >&2
+			exit 1 ;;
+	esac
+done
+
+# get rid of options, leaving only positional arguments
+shift $(($OPTIND-1))
+
+# make sure no instances of a server are already running
+pids="`"$THIS_SCRIPT_DIR"/curserv pid`"
+if [[ -n $pids ]]; then
+	echo "Servers are already running." >&2
+	echo "Process IDs: $pids" >&2
+	echo "Install Paths: `"$THIS_SCRIPT_DIR"/curserv install_path`" >&2
+	answer=""
+	while [[ $answer != "y" && $answer != "n" ]]; do
+		echo "Stop the servers and continue? [y/n]" >&2
+		read -sn 1 answer
+	done
+	if [[ $answer == "n" ]]; then exit 1; fi
+	for pid in $pids; do
+		kill $pid
+		while kill -0 $pid &> /dev/null; do
+			sleep .5
+		done
+	done
+fi
+
+# determine installation directory
+args="$@"
+if [[ $# -lt 1 ]]; then
+	install_dir="$INSTALLATIONS_DIR/`git branch --no-color | egrep '^\*' | sed 's/^..//'`"
+elif [[ ${args%/} =~ ^[^/]*$ ]]; then
+	install_dir="$INSTALLATIONS_DIR/$@"
+else
+	install_dir="$@"
+fi
+
+if [[ -z $install_dir ]]; then
+	echo "Error: Cannot determine installation directory." >&2
+	return 1
+fi
+
+# clean out the desired installation directory
+mkdir -p "$install_dir"
+rm -rf "$install_dir"/*
+
+# make sure we're in the root directory of the repository checkout
+repo_root_dir="`git rev-parse --show-toplevel 2> /dev/null`"
+if [[ -z $repo_root_dir ]]; then
+	echo "Error: Cannot determine root directory for the repository checkout." >&2
+	exit 1
+fi
+switch_cwd=0
+if [[ "$repo_root_dir" != "`pwd`" ]]; then
+	pushd "$repo_root_dir" &> /dev/null
+	switch_cwd=1
+fi
+
+# in case execution is prematurely terminated
+trap 'trap - ERR SIGHUP SIGINT SIGTERM; cleanup; exit 1' ERR SIGHUP SIGINT SIGTERM
+
+# handle any custom installation properties
+if [[ -n "$prefs_file" ]]; then
+	# save the original and move it back later so that git doesn't think there's a change to be committed
+	mv src/install/overlay/install.properties{,.tmp}
+	cp "$prefs_file" src/install/overlay/install.properties
+fi
+
+# force halt on failure if desired
+if [[ $halt_on_failure -eq 1 ]]; then
+	mv build.xml{,.tmp}
+	sed 's/haltonfailure="false"/haltonfailure="true"/' build.xml.tmp > build.xml
+fi
+
+ant $clean $resolve $resolve_plugins install -Dinstall.dir="$install_dir" $dojo $verbose $skip_tests
+
+cleanup

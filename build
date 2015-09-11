@@ -1,0 +1,141 @@
+#!/bin/bash
+set -e
+
+print_main_options() {
+	echo "  -c : Clean build directory first."
+	echo "  -C : Clean build and lib directories first. Overrides -c option."
+	echo "  -r : Resolve dependencies."
+	echo "  -d : Package Dojo (takes a while)."
+	echo "  -p : Resolve plugins."
+	echo "  -v : Verbose output."
+	echo "  -T : Skip running tests."
+	echo "  -f : Force halt on test failure."
+	echo "  -s <test_server_path>"
+	echo "    Override the path to the server to use for functional tests."
+	echo "    This can be shortened to the part after 'install' if it's"
+	echo "    located in the test directory. If it is omitted, will attempt"
+	echo "    to find the install directory for the first running instance"
+	echo "    of the server. [Default: /opt/ibm-ucd/server]"
+	echo "  -t <target>"
+	echo "    Specify a build target. Can be used multiple times to build"
+	echo "    multiple targets. [Default: compile]"
+}
+
+print_script_integration_options() {
+	echo "  -h 0 : Print getopts string (only meant for script integration)."
+	echo "  -h 1 : Print usage options (only meant for script integration)."
+}
+
+usage() {
+	echo "Usage: `basename "$0"` [options] [-- <extra_ant_arg> ...]"
+	echo "Options:"
+	print_main_options
+	print_script_integration_options
+}
+
+cleanup() {
+	if [[ $halt_on_failure -eq 1 ]]; then
+		mv build.xml{.tmp,}
+	fi
+}
+
+# fullpath: get the absolute path of something
+fullpath() {
+	if [[ "$OSTYPE" =~ ^[Dd]arwin ]]; then
+		realpath "$@"
+	elif [[ "$OSTYPE" =~ ^[Ll]inux ]]; then
+		readlink -f "$@"
+	fi
+}
+
+resolve_install_dir() {
+	local arg="$@"
+	local install_dir
+	if [[ -z "$arg" ]]; then
+		install_dir="`"$THIS_SCRIPT_DIR"/curserv -l 1 pid`"
+	elif [[ -e "$DS_SERVER_INSTALLATIONS_DIR/$arg" ]]; then
+		install_dir="$DS_SERVER_INSTALLATIONS_DIR/$arg"
+	elif [[ -e "$arg" ]]; then
+		install_dir="$arg"
+	fi
+
+	if [[ -z "$install_dir" ]]; then
+		echo "Error: cannot resolve install directory (${arg:-please specify})." >&2
+		return 1
+	fi
+	echo "$install_dir"
+}
+
+# constants
+OPTS_STRING=":cCrdpvTfs:t:"
+THIS_SCRIPT_DIR="$(dirname "`fullpath "$0"`")"
+
+if [[ $1 == "--help" ]]; then
+	usage
+	exit 0
+fi
+
+OPTIND=0 # ommitting this can cause a bug under some circumstances
+
+# default options
+clean=""
+resolve="-Dresolve.no=y"
+dojo="-Ddojo.build.no=y"
+verbose="-Denun.no=y"
+targets=""
+resolve_plugins=""
+halt_on_failure=0
+
+shopt -u nocasematch
+while getopts "${OPTS_STRING}h:" opt; do
+	case $opt in
+		h)
+			if [[ $OPTARG == "0" ]]; then
+				echo "$OPTS_STRING"
+			elif [[ $OPTARG == "1" ]]; then
+				print_main_options
+			else
+				echo "Error: Invalid argument for -h: $OPTARG" >&2
+				exit 1
+			fi
+			exit 0 ;;
+		c) [[ -z $clean ]] && clean="clean" ;;
+		C) clean="clean-all" ;;
+		r) resolve="resolve" ;;
+		d) dojo="" ;;
+		p) resolve_plugins="resolve-plugins" ;;
+		v) verbose="" ;;
+		T) skip_tests="-Dtests.no=y" ;;
+		f) halt_on_failure=1 ;;
+		s) test_server_path="-Dfunctional.test.server.path=\"`resolve_install_dir "$OPTARG"`\"" ;;
+		t) targets="$targets $OPTARG" ;;
+		\?)
+			echo "Invalid Option: -$OPTARG" >&2
+			usage >&2
+			exit 1 ;;
+	esac
+done
+
+shift $(($OPTIND-1))
+
+# in case execution is prematurely terminated
+trap 'trap - ERR SIGHUP SIGINT SIGTERM; cleanup; exit 1' ERR SIGHUP SIGINT SIGTERM
+
+# force halt on failure if desired
+if [[ $halt_on_failure -eq 1 ]]; then
+	mv build.xml{,.tmp}
+	sed 's/haltonfailure="false"/haltonfailure="true"/' build.xml.tmp > build.xml
+fi
+
+targets="${targets:-compile}"
+
+# avoid running the resolve target multiple times
+if [[ $resolve == 'resolve' ]]; then
+	if [[ -n `depends.py --resolve $targets` ]]; then
+		resolve=""
+	fi
+fi
+
+ant "$@" $clean $resolve $resolve_plugins ${targets:-compile} $test_server_path $skip_tests $dojo $verbose
+
+cleanup

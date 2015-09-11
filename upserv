@@ -1,0 +1,156 @@
+#!/bin/bash
+set -e
+
+# fullpath: get the absolute path of something
+fullpath() {
+	if [[ "$OSTYPE" =~ ^[Dd]arwin ]]; then
+		realpath "$@"
+	elif [[ "$OSTYPE" =~ ^[Ll]inux ]]; then
+		readlink -f "$@"
+	fi
+}
+
+usage() {
+	echo "Usage: `basename "$0"` [options] [<install_dir>]"
+	echo "Options:"
+	echo "  -d : Run the server in debug mode when starting it."
+	echo "  -j : Don't Include Java changes with update."
+	echo "  -u : Don't Include UI changes (JS, CSS, HTML, JSP) with update."
+	echo "  -b : Don't build before updating."
+	echo "  -p <project_dir>"
+	echo "    Specify the project directory from which to pull updated code. [Default: .]"
+	echo "Notes:"
+	"$THIS_SCRIPT_DIR"/_install_dir_notes server
+}
+
+# constants
+THIS_SCRIPT_DIR="$(dirname "`fullpath "$0"`")"
+INSTALLATIONS_DIR="$DS_SERVER_INSTALLATIONS_DIR"
+
+if [[ $1 == "--help" || $1 == "-h" ]]; then
+	usage
+	exit 0
+fi
+
+OPTIND=0 # ommitting this can cause a bug
+
+# default options
+debug=""
+do_build=1
+update_java=1
+update_ui=1
+project_dir=''
+
+shopt -u nocasematch
+while getopts ":djubp:" opt; do
+	case $opt in
+		d) debug="-debug" ;;
+		j) update_java=0 ;;
+		u) update_ui=0 ;;
+		b) do_build=0 ;;
+		p) project_dir="$OPTARG" ;;
+		\?)
+			echo "Invalid Option: -$OPTARG" >&2
+			usage >&2
+			exit 1 ;;
+		:)
+			echo "Option -$OPTARG requires an additional argument" >&2
+			usage >&2
+			exit 1 ;;
+	esac
+done
+
+# get rid of options, leaving only positional arguments
+shift $(($OPTIND-1))
+
+# determine the server installation directory
+install_dir=""
+if [[ -n $1 ]]; then
+	install_dir="`"$THIS_SCRIPT_DIR"/_resolve_install_dir server "$1"`"
+	shift
+else
+	install_dir="`"$THIS_SCRIPT_DIR"/_resolve_install_dir server`"
+fi
+
+if [[ -n $project_dir ]]; then
+	pushd "$project_dir" &> /dev/null
+fi
+
+# make sure the server installation directory was able to be resolved
+if [[ -z $install_dir || ! -e $install_dir ]]; then
+	# make one last attempt to resolve the installation directory based on the project directory
+	if [[ -n $project_dir ]]; then
+		install_dir="`"$THIS_SCRIPT_DIR"/_resolve_install_dir server`"
+	fi
+fi
+if [[ -z $install_dir || ! -e $install_dir ]]; then
+	if [[ -n $project_dir ]]; then
+		popd &> /dev/null
+	fi
+	echo "Error: Cannot determine desired installation directory." >&2
+	exit 1
+fi
+
+echo "Using server at: $install_dir"
+
+# build first b/c if build fails and Java is being updated, don't want to kill any running server instance
+if [[ $do_build -eq 1 ]]; then
+	"$THIS_SCRIPT_DIR"/build -CrTt dist
+fi
+
+if [[ $update_java -eq 1 ]]; then
+	# make sure the specified server isn't currently running
+	server_pids="`"$THIS_SCRIPT_DIR"/curserv -i "$install_dir" pid`"
+	if [[ -n $server_pids ]]; then
+		echo "Waiting for running instances of the server to stop."
+		for server_pid in $server_pids; do
+			"$install_dir/bin/server" stop
+			while kill -0 $server_pid &> /dev/null; do
+				sleep .5
+			done
+		done
+	fi
+
+	echo "Updating Back-End"
+	echo "-----------------"
+	# update the Java portion of the specified server
+	cp dist/server/ibm-ucd.jar "$install_dir/lib"
+fi
+
+if [[ $update_ui -eq 1 ]]; then
+	echo "Updating UI"
+	echo "-----------"
+	serverVersion="$(command ls -1 $install_dir/opt/tomcat/webapps/ROOT/static/ | head -1)"
+
+	echo "Using server version: $serverVersion"
+	echo "Deleting existing UI content"
+	rm -rf $install_dir/opt/tomcat/webapps/ROOT/static/$serverVersion/images/{deploy,icons}
+	rm -rf $install_dir/opt/tomcat/webapps/ROOT/static/$serverVersion/js/deploy/{widgets,views}
+	rm -rf $install_dir/opt/tomcat/webapps/ROOT/static/$serverVersion/css/deploy
+	rm -rf $install_dir/opt/tomcat/webapps/ROOT/static/$serverVersion/conf
+	rm -rf $install_dir/opt/tomcat/webapps/ROOT/WEB-INF/jsps
+	rm -f $install_dir/opt/tomcat/webapps/ROOT/WEB-INF/web.xml
+	rm -f $install_dir/opt/tomcat/webapps/ROOT/*.jsp
+	rm -f $install_dir/conf/server/ds-navigation.config
+
+	echo "Copying new UI content"
+	cp -R src/web/war/images/deploy $install_dir/opt/tomcat/webapps/ROOT/static/$serverVersion/images/deploy
+	cp -R src/web/war/images/icons $install_dir/opt/tomcat/webapps/ROOT/static/$serverVersion/images/icons
+	cp -R src/web/war/js/deploy/widgets $install_dir/opt/tomcat/webapps/ROOT/static/$serverVersion/js/deploy/widgets
+	cp -R src/web/war/js/deploy/views $install_dir/opt/tomcat/webapps/ROOT/static/$serverVersion/js/deploy/views
+	cp -R src/web/war/css/deploy $install_dir/opt/tomcat/webapps/ROOT/static/$serverVersion/css/deploy
+	cp -R src/web/war/conf $install_dir/opt/tomcat/webapps/ROOT/static/$serverVersion/conf
+	cp -R src/web/war/WEB-INF/jsps $install_dir/opt/tomcat/webapps/ROOT/WEB-INF/jsps
+	cp src/web/war/WEB-INF/web.xml $install_dir/opt/tomcat/webapps/ROOT/WEB-INF
+	cp src/web/war/*.jsp $install_dir/opt/tomcat/webapps/ROOT
+	cp conf/server/ds-navigation.config $install_dir/conf/server
+fi
+
+if [[ -n $project_dir ]]; then
+	popd &> /dev/null
+fi
+
+if [[ $update_java -eq 1 ]]; then
+	# start the specified server
+	"$install_dir/bin/server" run $debug &
+fi
