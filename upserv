@@ -112,7 +112,9 @@ if [[ $update_java -eq 1 ]]; then
 	fi
 
 	echo "Updating Back-End"
-	echo "-----------------"
+	if [[ $update_ui ]]; then
+		echo
+	fi
 	# update the Java portion of the specified server
 	cp dist/server/ibm-ucd.jar "$install_dir/lib"
 fi
